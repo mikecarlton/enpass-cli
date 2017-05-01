@@ -29,10 +29,15 @@ import (
     "golang.org/x/crypto/ssh/terminal"
     "database/sql"
     _ "github.com/xeodou/go-sqlcipher"
+    "github.com/keybase/go-keychain"
 )
 
 func check(err error) {
     if err != nil {
+        if err.Error() == "file is encrypted or is not a database" {
+            err = fmt.Errorf(
+                "Your password is incorrect or the file is not a database")
+        }
         fmt.Fprintln(os.Stderr, err)
         os.Exit(1)
     }
@@ -43,6 +48,61 @@ func max(x, y int) int {
         return x
     }
     return y
+}
+
+const KC_SERVICE = "enpass-cli"
+const KC_ACCOUNT = ""
+const KC_LABEL = ""
+const KC_GROUP = ""
+
+// get password from keychain if possible, else get from user
+func getPassword() (password string, entered bool) {
+    if runtime.GOOS == "darwin" {
+        // look in keychain
+        password_bytes, _ := keychain.GetGenericPassword(KC_SERVICE,
+                                            KC_ACCOUNT, KC_LABEL, KC_GROUP)
+        if password_bytes != nil {
+            password = string(password_bytes)
+            return
+        }
+    }
+
+    // else prompt and read from keyboard
+    fmt.Fprint(os.Stderr, "Password: ")
+    password_bytes, err := terminal.ReadPassword(syscall.Stdin)
+    check(err)
+
+    password = string(password_bytes)
+    fmt.Println()
+    entered = true
+
+    return
+}
+
+// save for future if requested
+func savePassword(password string) {
+    if runtime.GOOS == "darwin" {
+        item := keychain.NewGenericPassword(KC_SERVICE, KC_ACCOUNT, KC_LABEL,
+                                            []byte(password), KC_GROUP)
+        item.SetSynchronizable(keychain.SynchronizableNo)
+        item.SetAccessible(keychain.AccessibleWhenUnlocked)
+        err := keychain.AddItem(item)
+        check(err)
+    }
+
+    return
+}
+
+// clear password from keychain
+func clearPassword() {
+    if runtime.GOOS == "darwin" {
+        err := keychain.DeleteGenericPasswordItem(KC_SERVICE, KC_ACCOUNT)
+        if err != keychain.ErrorItemNotFound {
+            check(err)
+        }
+    }
+
+    return
 }
 
 // return a key created via pkdbf SHA-256
@@ -69,21 +129,12 @@ func getCryptoParams(db *sql.DB) (iv, key []byte) {
 }
 
 // open and return the db handle for the enpass db
-func openDb(db_file string) (db *sql.DB) {
+func openDb(db_file string, password string) (db *sql.DB) {
     if verbose {
         fmt.Fprintf(os.Stderr, "Reading database file '%s'\n", db_file)
     }
     db, err := sql.Open("sqlite3", db_file)
     check(err)
-
-    password, ok := os.LookupEnv("ENPASS_PASSWORD")
-    if !ok {
-        fmt.Fprint(os.Stderr, "Password: ")
-        password_bytes, err := terminal.ReadPassword(syscall.Stdin)
-        check(err)
-        password = string(password_bytes)
-        fmt.Println()
-    }
 
     err = db.Ping()
     check(err)
@@ -171,20 +222,6 @@ func (field Field) label() (label string) {
             label = strings.Title(strings.Replace(field.Type, "_", " ", -1))
         }
     }
-
-    /*
-    if field.Label != "" {
-        label = field.Label
-        return
-    }
-
-    value, ok := specialLabel[field.Type]
-    if ok {
-        label = value
-    } else {
-        label = strings.Title(strings.Replace(field.Type, "_", " ", -1))
-    }
-    */
 
     return
 }
@@ -390,7 +427,7 @@ func main() {
     var db_file string
     var delay int
     var match_all, full_display, expanded_display, show_sensitive,
-        no_copy_password, unlimited bool
+        no_copy_password, unlimited, save_to_keychain, clear_from_keychain bool
 
     flag.StringVar(&db_file, "file", "", "enpass db file")
     flag.BoolVar(&verbose, "v", false, "set verbose mode")
@@ -398,6 +435,10 @@ func main() {
                 "seconds before clearing password from clipboard")
     flag.BoolVar(&match_all, "a", false, "match all records (implies -u)")
     flag.BoolVar(&unlimited, "u", false, "show all matching records")
+    flag.BoolVar(&save_to_keychain, "k", false,
+                 "save master password to keychain")
+    flag.BoolVar(&clear_from_keychain, "K", false,
+                 "clear master password from keychain")
     flag.BoolVar(&full_display, "c", false, "show full cards")
     flag.BoolVar(&expanded_display, "C", false,
                  "show full cards, including blank fields")
@@ -434,7 +475,11 @@ func main() {
     match_user := flag.NArg() == 2
     user := strings.ToLower(flag.Arg(1))
 
-    db := openDb(db_file)
+    if clear_from_keychain {
+        clearPassword()
+    }
+    password, password_entered := getPassword()
+    db := openDb(db_file, password)
     defer db.Close()
 
     iv, key := getCryptoParams(db)
@@ -478,5 +523,10 @@ func main() {
 
     if password_message != "" {
         fmt.Fprintf(os.Stderr, "\n%s\n", password_message)
+    }
+
+    // only save if requested and entered and no errors
+    if save_to_keychain && password_entered {
+        savePassword(password)
     }
 }

@@ -6,6 +6,7 @@ These are macOS-specific (tested on Sierra 10.12.4)
 ```
 go get -v -u github.com/mattn/go-sqlite3
 go get -v -u github.com/xeodou/go-sqlcipher
+go get -v -u github.com/keybase/go-keychain
 ```
 
 You must provide openssl headers for go-sqlcipher to build
