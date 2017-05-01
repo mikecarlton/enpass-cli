@@ -1,9 +1,10 @@
-
 /*
   Access Enpass from CLI
+  https://www.enpass.io/
 
-  Copyright 2017 Mike Carlton
-  mike@carltons.us
+  Copyright 2017 Mike Carlton mike@carltons.us
+
+  This software is not affiliated with, created by or supported by Enpass
 
   Released under terms of the MIT License:
     http://www.opensource.org/licenses/mit-license.php
@@ -13,10 +14,12 @@ package main
 
 import (
     "os"
+    "os/exec"
     "runtime"
     "syscall"
     "flag"
     "fmt"
+    "bytes"
     "strings"
     "encoding/json"
     "crypto/cipher"
@@ -35,12 +38,21 @@ func check(err error) {
     }
 }
 
+func max(x, y int) int {
+    if x > y {
+        return x
+    }
+    return y
+}
+
+// return a key created via pkdbf SHA-256
 func generateKey(hash, salt []byte) (key []byte) {
     key = pbkdf2.Key(hash, salt, 2, 32, sha256.New)
 
     return
 }
 
+// extract the key and iv for fields from Identity row
 func getCryptoParams(db *sql.DB) (iv, key []byte) {
     var id, version, signature, sync_uuid string
     var hash, info []byte
@@ -56,6 +68,7 @@ func getCryptoParams(db *sql.DB) (iv, key []byte) {
     return
 }
 
+// open and return the db handle for the enpass db
 func openDb(db_file string) (db *sql.DB) {
     if verbose {
         fmt.Fprintf(os.Stderr, "Reading database file '%s'\n", db_file)
@@ -87,6 +100,7 @@ func openDb(db_file string) (db *sql.DB) {
     return
 }
 
+// decrypt card data, returning json blob
 func decrypt(data, iv, key []byte) (card_json []byte) {
     block, err := aes.NewCipher(key)
     check(err)
@@ -104,6 +118,7 @@ func decrypt(data, iv, key []byte) (card_json []byte) {
     return
 }
 
+// Enpass DB structures
 type History struct {
     Updatetime string
     value string
@@ -130,6 +145,50 @@ type Card struct {
     Uuid string
 }
 
+// exceptions from the standard mapping
+var specialLabel = map[string]string {
+      "pin": "PIN",
+      "url": "URL",
+      "cvc": "CVC",
+      "card_cvc": "Card CVC",
+      "card_pin": "Card PIN",
+}
+
+// return Label if present, else generated label (replace '_' and titleize)
+func (field Field) label() (label string) {
+    switch {
+    case field.Label != "":
+        label = field.Label
+    case field.Type == "text" && field.Sensitive == 0:
+        label = "Security question"
+    case field.Type == "text" && field.Sensitive != 0:
+        label = "Security answer"
+    default:
+        value, ok := specialLabel[field.Type]
+        if ok {
+            label = value
+        } else {
+            label = strings.Title(strings.Replace(field.Type, "_", " ", -1))
+        }
+    }
+
+    /*
+    if field.Label != "" {
+        label = field.Label
+        return
+    }
+
+    value, ok := specialLabel[field.Type]
+    if ok {
+        label = value
+    } else {
+        label = strings.Title(strings.Replace(field.Type, "_", " ", -1))
+    }
+    */
+
+    return
+}
+
 // return field(s) of given type
 func (card Card) fieldsByType(typeName string) (fields []Field) {
     typeName = strings.ToLower(typeName)
@@ -143,7 +202,7 @@ func (card Card) fieldsByType(typeName string) (fields []Field) {
 }
 
 // return value of first non-empty field of given type
-func (card Card) firstByType(typeName string) (value string, err error) {
+func (card Card) firstFieldByType(typeName string) (value string, err error) {
     fields := card.fieldsByType(typeName)
     if len(fields) > 0 && fields[0].Value != "" {
         value = fields[0].Value
@@ -154,10 +213,12 @@ func (card Card) firstByType(typeName string) (value string, err error) {
     return
 }
 
+// get user field of the card
+// defined as the first password or the first email if there is no username
 func (card Card) getUser() (name string, err error) {
-    name, err = card.firstByType("username")
+    name, err = card.firstFieldByType("username")
     if err != nil {
-        name, err = card.firstByType("email")
+        name, err = card.firstFieldByType("email")
     }
 
     if err != nil {
@@ -181,29 +242,97 @@ func (card Card) fieldsMatchByType(name, value string) (fields []Field) {
     return
 }
 
-func (card Card) display(one_line, show_password bool) {
-    if one_line {
-        user, _ := card.getUser()
-        url, _ := card.firstByType("url")
-        password := ""
-        if show_password {
-            password, _ = card.firstByType("password")
-        }
-        fmt.Printf("%s: %s  %s  %s\n", card.Name, user, url, password)
-    } else {
+// display the card as requested
+//      default is single line
+//      full shows all non-empty fields
+//      expanded shows all fields
+func (card Card) display(full_display, expanded_display, show_sensitive bool) {
+    if full_display || expanded_display {
+        const noteLabel = "Note"
+        const indent = 4
+
         fmt.Println(card.Name)
 
-        for _, f := range(card.Fields) {
-            value := f.Value
-            if f.Sensitive != 0 {
-                value = "*****"
+        width := 0
+        for pass := 0; pass <= 1 ; pass++ {
+            for _, f := range(card.Fields) {
+                value := f.Value
+                if f.Sensitive != 0 && !show_sensitive && value != "" {
+                    value = "*****"
+                }
+
+                if expanded_display || value != "" {
+                    if pass == 0 {
+                        width = max(width, len(f.label()))
+                    } else {
+                        fmt.Printf("%*s: %s\n", width+indent, f.label(), value)
+                    }
+                }
             }
 
-            fmt.Printf("\t%s (%s): %s\n", f.Label, f.Type, value)
+            if expanded_display || card.Note != "" {
+                if pass == 0 {
+                    width = max(width, len(noteLabel))
+                } else {
+                    fmt.Printf("%*s: %s\n", width+indent, noteLabel, card.Note)
+                }
+            }
         }
-        fmt.Println("\tNote: ", card.Note)
+    } else {
+        user, _ := card.getUser()
+        url, _ := card.firstFieldByType("url")
+        password := ""
+        if show_sensitive {
+            password, _ = card.firstFieldByType("password")
+        }
+        fmt.Printf("%s:  %s  %s  %s\n", card.Name, user, url, password)
     }
 }
+
+// copy the password to the clipboard and restore old contents after delay
+func (card Card) passwordToClipboard(delay int) (err error) {
+    if runtime.GOOS != "darwin" {
+        err = fmt.Errorf("Password copy is not supported on this platform")
+        return
+    }
+
+    password, err := card.firstFieldByType("password")
+    if err != nil {
+        err = fmt.Errorf("Could not find any password to paste")
+        return
+    }
+
+    // save the current clipboard
+    cmd := exec.Command("pbpaste")
+    var current_clipboard bytes.Buffer
+    cmd.Stdout = &current_clipboard
+    err = cmd.Run()
+    if err != nil {
+        err = fmt.Errorf("Unable to save the current clipboard: %s", err)
+        return
+    }
+
+    // put the password on the clipboard
+    cmd = exec.Command("pbcopy")
+    cmd.Stdin = strings.NewReader(password)
+    err = cmd.Run()
+    if err != nil {
+        err = fmt.Errorf("Unable to copy the password to the clipboard: %s",
+                         err)
+        return
+    }
+
+    cmd = exec.Command("/bin/sh", "-c", fmt.Sprintf("sleep %d ; pbcopy", delay))
+    cmd.Stdin = strings.NewReader(current_clipboard.String())
+    err = cmd.Start()
+    if err != nil {
+        err = fmt.Errorf("Unable to clear the password from clipboard: %s", err)
+        return
+    }
+
+    return
+}
+
 
 func getCards(db *sql.DB, iv, key []byte) (cards []Card) {
     rows, err := db.Query("SELECT title, subtitle, data " +
@@ -259,13 +388,22 @@ func main() {
     }
 
     var db_file string
-    var match_all, one_line, show_password bool
+    var delay int
+    var match_all, full_display, expanded_display, show_sensitive,
+        no_copy_password, unlimited bool
 
     flag.StringVar(&db_file, "file", "", "enpass db file")
     flag.BoolVar(&verbose, "v", false, "set verbose mode")
-    flag.BoolVar(&match_all, "a", false, "match all records")
-    flag.BoolVar(&one_line, "o", false, "show records on one line")
-    flag.BoolVar(&show_password, "p", false, "show passwords")
+    flag.IntVar(&delay, "d", 30,
+                "seconds before clearing password from clipboard")
+    flag.BoolVar(&match_all, "a", false, "match all records (implies -u)")
+    flag.BoolVar(&unlimited, "u", false, "show all matching records")
+    flag.BoolVar(&full_display, "c", false, "show full cards")
+    flag.BoolVar(&expanded_display, "C", false,
+                 "show full cards, including blank fields")
+    flag.BoolVar(&show_sensitive, "s", false,
+                 "show sensitive fields (including passwords)")
+    flag.BoolVar(&no_copy_password, "n", false, "do not copy password")
     flag.Parse()
 
     if db_file == "" {
@@ -302,16 +440,43 @@ func main() {
     iv, key := getCryptoParams(db)
 
     cards := getCards(db, iv, key)
+    num_matched := 0
+    password_message := ""
     for _, card := range cards {
         match := match_all || strings.Contains(strings.ToLower(card.Name), name)
         if match && match_user {
             cardUser, err := card.getUser()
             match = err == nil &&
-                        strings.Contains(strings.ToLower(cardUser), user)
+                    strings.Contains(strings.ToLower(cardUser), user)
         }
 
         if match {
-            card.display(one_line, show_password)
+            num_matched += 1
+            if num_matched == 1 || unlimited || match_all {
+                if num_matched > 1 && (full_display || expanded_display) {
+                    fmt.Println()
+                }
+                card.display(full_display, expanded_display, show_sensitive)
+            }
+
+            if num_matched == 1 && !no_copy_password {
+                err := card.passwordToClipboard(delay)
+                if err != nil {
+                    password_message = fmt.Sprintf("%v", err)
+                } else {
+                    password_message = fmt.Sprintf(
+                        "Password copied to clipboard, clearing in %d seconds",
+                                                   delay)
+               }
+            }
         }
+    }
+
+    if num_matched > 1 {
+        fmt.Fprintf(os.Stderr, "Matched %d cards\n", num_matched)
+    }
+
+    if password_message != "" {
+        fmt.Fprintf(os.Stderr, "\n%s\n", password_message)
     }
 }
