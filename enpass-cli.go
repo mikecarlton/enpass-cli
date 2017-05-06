@@ -113,13 +113,27 @@ func generateKey(hash, salt []byte) (key []byte) {
 }
 
 // extract the key and iv for fields from Identity row
-func getCryptoParams(db *sql.DB) (iv, key []byte) {
+func getCryptoParams(db *sql.DB, ignore_version bool) (iv, key []byte) {
     var id, version, signature, sync_uuid string
     var hash, info []byte
+    const VERSION = "5"
+    const SIGNATURE = "WalletxDb"
 
     row := db.QueryRow("SELECT * FROM Identity")
     err := row.Scan(&id, &version, &signature, &sync_uuid, &hash, &info)
     check(err)
+
+    if (version != VERSION || signature != SIGNATURE) && !ignore_version {
+        fmt.Fprintf(os.Stderr,
+                    "Database version is '%s' and signature is '%s'\n",
+                    version, signature)
+        fmt.Fprintf(os.Stderr,
+                "The program is designed for version '%s' and signature '%s'\n",
+                VERSION, SIGNATURE)
+        fmt.Fprintf(os.Stderr,
+               "To execute in spite of the difference, please use '-ignore'\n")
+        os.Exit(1)
+    }
 
     iv = info[16:32]
     salt := info[32:48]
@@ -427,7 +441,8 @@ func main() {
     var db_file string
     var delay int
     var match_all, full_display, expanded_display, show_sensitive,
-        no_copy_password, unlimited, save_to_keychain, clear_from_keychain bool
+        no_copy_password, unlimited, save_to_keychain, clear_from_keychain,
+        ignore_version bool
 
     flag.StringVar(&db_file, "file", "", "enpass db file")
     flag.BoolVar(&verbose, "v", false, "set verbose mode")
@@ -445,6 +460,8 @@ func main() {
     flag.BoolVar(&show_sensitive, "s", false,
                  "show sensitive fields (including passwords)")
     flag.BoolVar(&no_copy_password, "n", false, "do not copy password")
+    flag.BoolVar(&ignore_version, "ignore", false,
+                 "run with unsupported database version")
     flag.Parse()
 
     if db_file == "" {
@@ -482,7 +499,7 @@ func main() {
     db := openDb(db_file, password)
     defer db.Close()
 
-    iv, key := getCryptoParams(db)
+    iv, key := getCryptoParams(db, ignore_version)
 
     cards := getCards(db, iv, key)
     num_matched := 0
