@@ -123,6 +123,13 @@ func getCryptoParams(db *sql.DB, ignore_version bool) (iv, key []byte) {
     err := row.Scan(&id, &version, &signature, &sync_uuid, &hash, &info)
     check(err)
 
+    if debug {
+        fmt.Fprintf(os.Stderr,
+            "Id: %v, version: %v, signature: %v, sync uuid %v, hash bytes: %d, info bytes: %d\n",
+            id, version, signature, sync_uuid, len(hash), len(info))
+        fmt.Println()
+    }
+
     if (version != VERSION || signature != SIGNATURE) && !ignore_version {
         fmt.Fprintf(os.Stderr,
                     "Database version is '%s' and signature is '%s'\n",
@@ -201,7 +208,16 @@ type Field struct {
 }
 
 type Card struct {
-    Fields []Field
+    id int                  // from db
+    uuid string
+    title string
+    subtitle string
+    ctype string
+    category string
+    deleted int
+    trashed int
+
+    Fields []Field          // rest unmarshalled from data json
     Iconid int64
     Name string
     Note string
@@ -293,43 +309,20 @@ func (card Card) fieldsMatchByType(name, value string) (fields []Field) {
     return
 }
 
+type View int
+
+const (
+    SingleLineView View = iota
+    CardView
+    FullCardView
+)
+
 // display the card as requested
 //      default is single line
 //      full shows all non-empty fields
 //      expanded shows all fields
-func (card Card) display(full_display, expanded_display, show_sensitive bool) {
-    if full_display || expanded_display {
-        const noteLabel = "Note"
-        const indent = 4
-
-        fmt.Println(card.Name)
-
-        width := 0
-        for pass := 0; pass <= 1 ; pass++ {
-            for _, f := range(card.Fields) {
-                value := f.Value
-                if f.Sensitive != 0 && !show_sensitive && value != "" {
-                    value = "*****"
-                }
-
-                if expanded_display || value != "" {
-                    if pass == 0 {
-                        width = max(width, len(f.label()))
-                    } else {
-                        fmt.Printf("%*s: %s\n", width+indent, f.label(), value)
-                    }
-                }
-            }
-
-            if expanded_display || card.Note != "" {
-                if pass == 0 {
-                    width = max(width, len(noteLabel))
-                } else {
-                    fmt.Printf("%*s: %s\n", width+indent, noteLabel, card.Note)
-                }
-            }
-        }
-    } else {
+func (card Card) display(view View, show_sensitive bool) {
+    if view == SingleLineView {
         user, _ := card.getUser()
         url, _ := card.firstFieldByType("url")
         password := ""
@@ -337,6 +330,40 @@ func (card Card) display(full_display, expanded_display, show_sensitive bool) {
             password, _ = card.firstFieldByType("password")
         }
         fmt.Printf("%s:  %s  %s  %s\n", card.Name, user, url, password)
+        return
+    }
+
+    const noteLabel = "Note"
+    const indent = 4
+
+    fmt.Println(card.Name)
+
+    width := 0
+    type_width := 0
+    for pass := 0; pass <= 1 ; pass++ {
+        for _, f := range(card.Fields) {
+            value := f.Value
+            if f.Sensitive != 0 && !show_sensitive && value != "" {
+                value = "*****"
+            }
+
+            if view > CardView || value != "" {
+                if pass == 0 {
+                    width = max(width, len(f.label()))
+                    type_width = max(type_width, len(f.Type))
+                } else {
+                    fmt.Printf("%*s: %s\n", width+indent, f.label(), value)
+                }
+            }
+        }
+
+        if view > CardView || card.Note != "" {
+            if pass == 0 {
+                width = max(width, len(noteLabel))
+            } else {
+                fmt.Printf("%*s: %s\n", width+indent, noteLabel, card.Note)
+            }
+        }
     }
 }
 
@@ -384,28 +411,71 @@ func (card Card) passwordToClipboard(delay int) (err error) {
     return
 }
 
+func jsonPrettyPrint(in []byte) (string) {
+    var out bytes.Buffer
+    err := json.Indent(&out, in, "", "\t")
+    if err != nil {
+        return string(in)
+    }
+    return out.String()
+}
 
-func getCards(db *sql.DB, iv, key []byte) (cards []Card) {
-    rows, err := db.Query("SELECT title, subtitle, data " +
-                           "FROM Cards " +
-                           "WHERE deleted = 0 AND trashed = 0")
+func dumpCard(db *sql.DB, iv, key []byte, id int) {
+    var (
+            iconid, updatetime, deleted, trashed int
+            title, subtitle, ctype, category, customiconid, uuid, urls,
+                formfields string
+            data []byte
+    )
+
+    row := db.QueryRow("SELECT * FROM Cards WHERE id = ?", id)
+    err := row.Scan(&id, &title, &subtitle, &ctype, &category, &iconid,
+                    &customiconid, &updatetime, &uuid, &data, &trashed,
+                    &deleted, &urls, &formfields)
+    check(err)
+
+    fmt.Printf("id: %d, title: '%s', subtitle: '%s'\n", id, title, subtitle)
+    fmt.Printf("    uuid: %s, deleted: %d, trashed: %d\n",
+               uuid, deleted, trashed)
+    fmt.Printf("    type: '%s', category: '%s', icon id: %d, custom icon id :'%s'\n",
+               ctype, category, iconid, customiconid);
+    fmt.Printf("    urls: '%s', formfields: '%s'\n", urls, formfields)
+
+    card_json := decrypt(data, iv, key)
+    fmt.Printf("    data: '%s'\n", jsonPrettyPrint(card_json))
+
+    return
+}
+
+func getCards(db *sql.DB, iv, key []byte, include_deleted bool) (cards []Card) {
+    query := "SELECT id, uuid, title, subtitle, deleted, " +
+             "       trashed, type, category, data " +
+             "FROM Cards"
+    if !include_deleted {
+        query += " WHERE deleted = 0 AND trashed = 0"
+    }
+    query += " ORDER BY title, trashed, deleted"
+
+    rows, err := db.Query(query)
     check(err)
     defer rows.Close()
 
     for rows.Next() {
         var (
-            title string
-            subtitle string
+            id int
+            uuid string
+            title, subtitle string
+            deleted, trashed int
+            ctype, category string
             data []byte
         )
 
-        err := rows.Scan(&title, &subtitle, &data)
+        err := rows.Scan(&id, &uuid, &title, &subtitle, &deleted, &trashed,
+                         &ctype, &category, &data)
         check(err)
 
         card_json := decrypt(data, iv, key)
-        // fmt.Println(title)
-        // fmt.Println(subtitle)
-        // fmt.Println(string(card_json))
+
         var card Card
         err = json.Unmarshal(card_json, &card)
         if err != nil {
@@ -413,6 +483,19 @@ func getCards(db *sql.DB, iv, key []byte) (cards []Card) {
         }
         check(err)
 
+        card.id = id
+        card.uuid = uuid
+        card.title = title
+        card.subtitle = subtitle
+        card.ctype = ctype
+        card.category = category
+        card.deleted = deleted
+        card.trashed = trashed
+
+        if uuid != card.Uuid {
+            fmt.Println("Warning: card title '%s' != name '%s'",
+                        title, card.Name)
+        }
         if title != card.Name {
             fmt.Println("Warning: card title '%s' != name '%s'",
                         title, card.Name)
@@ -429,6 +512,7 @@ func getCards(db *sql.DB, iv, key []byte) (cards []Card) {
 }
 
 var verbose = false
+var debug = false
 
 func main() {
     flag.Usage = func() {
@@ -440,13 +524,13 @@ func main() {
 
     var db_file string
     var delay int
-    var match_all, full_display, expanded_display, show_sensitive,
-        no_copy_password, unlimited, save_to_keychain, clear_from_keychain,
-        ignore_version bool
+    var match_all, show_sensitive, no_copy_password, unlimited, include_deleted,
+        save_to_keychain, clear_from_keychain, ignore_version bool
+    var full_display, expanded_display bool
 
     flag.StringVar(&db_file, "file", "", "enpass db file")
     flag.BoolVar(&verbose, "v", false, "set verbose mode")
-    flag.IntVar(&delay, "d", 30,
+    flag.IntVar(&delay, "w", 30,
                 "seconds before clearing password from clipboard")
     flag.BoolVar(&match_all, "a", false, "match all records (implies -u)")
     flag.BoolVar(&unlimited, "u", false, "show all matching records")
@@ -457,12 +541,21 @@ func main() {
     flag.BoolVar(&full_display, "c", false, "show full cards")
     flag.BoolVar(&expanded_display, "C", false,
                  "show full cards, including blank fields")
+    flag.BoolVar(&include_deleted, "d", false, "include deleted records")
+    flag.BoolVar(&debug, "D", false, "set debug mode")
     flag.BoolVar(&show_sensitive, "s", false,
                  "show sensitive fields (including passwords)")
     flag.BoolVar(&no_copy_password, "n", false, "do not copy password")
     flag.BoolVar(&ignore_version, "ignore", false,
                  "run with unsupported database version")
     flag.Parse()
+
+    var view View
+    switch {
+    case full_display: view = CardView
+    case expanded_display: view = FullCardView
+    default: view = SingleLineView
+    }
 
     if db_file == "" {
         db_file = os.Getenv("ENPASS_DB_FILE")
@@ -501,7 +594,7 @@ func main() {
 
     iv, key := getCryptoParams(db, ignore_version)
 
-    cards := getCards(db, iv, key)
+    cards := getCards(db, iv, key, include_deleted)
     num_matched := 0
     password_message := ""
     for _, card := range cards {
@@ -515,10 +608,15 @@ func main() {
         if match {
             num_matched += 1
             if num_matched == 1 || unlimited || match_all {
-                if num_matched > 1 && (full_display || expanded_display) {
+                if num_matched > 1 && view > SingleLineView {
                     fmt.Println()
                 }
-                card.display(full_display, expanded_display, show_sensitive)
+                card.display(view, show_sensitive)
+            }
+
+            if debug {
+                fmt.Println()
+                dumpCard(db, iv, key, card.id)
             }
 
             if num_matched == 1 && !no_copy_password {
