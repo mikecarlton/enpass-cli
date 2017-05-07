@@ -319,9 +319,7 @@ const (
 
 // display the card as requested
 //      default is single line
-//      full shows all non-empty fields
-//      expanded shows all fields
-func (card Card) display(view View, show_sensitive bool) {
+func (card Card) display(view View, show_sensitive bool, include_deleted bool) {
     if view == SingleLineView {
         user, _ := card.getUser()
         url, _ := card.firstFieldByType("url")
@@ -347,7 +345,8 @@ func (card Card) display(view View, show_sensitive bool) {
                 value = "*****"
             }
 
-            if view > CardView || value != "" {
+            if (value != "" || view > CardView) &&
+                    (f.Isdeleted == 0 || include_deleted) {
                 if pass == 0 {
                     width = max(width, len(f.label()))
                     type_width = max(type_width, len(f.Type))
@@ -611,7 +610,7 @@ func main() {
                 if num_matched > 1 && view > SingleLineView {
                     fmt.Println()
                 }
-                card.display(view, show_sensitive)
+                card.display(view, show_sensitive, include_deleted)
             }
 
             if debug {
