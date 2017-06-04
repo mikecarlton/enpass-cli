@@ -2,7 +2,7 @@
   Access Enpass from CLI
   https://www.enpass.io/
 
-  Copyright 2017 Mike Carlton mike@carltons.us
+  Copyright (c) 2017 Mike Carlton mike@carltons.us
 
   This software is not affiliated with, created by or supported by Enpass
 
