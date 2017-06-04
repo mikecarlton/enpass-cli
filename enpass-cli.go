@@ -30,6 +30,7 @@ import (
     "database/sql"
     _ "github.com/xeodou/go-sqlcipher"
     "github.com/keybase/go-keychain"
+//    "github.com/posener/complete"
 )
 
 func check(err error) {
